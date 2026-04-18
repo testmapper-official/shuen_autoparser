@@ -1,0 +1,1 @@
+# shuen_autoparser
