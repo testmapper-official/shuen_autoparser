@@ -1,4 +1,4 @@
-import os, json, time, ctypes, threading, importlib, hashlib, requests, sys
+import os, json, time, ctypes, threading, importlib, hashlib, requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -6,28 +6,10 @@ from flask import Flask, render_template, request, jsonify
 from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- ИСПРАВЛЕНИЕ ПУТЕЙ ДЛЯ PYINSTALLER ---
-def resource_path(relative_path):
-    """ Получает абсолютный путь к ресурсу, работает и в dev-режиме, и в скомпилированном exe """
-    try:
-        # PyInstaller создает временную папку и пишет путь в _MEIPASS
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
+CONFIG_FILE = 'config.json'
+BACKUP_DIR = 'backups'
 
-# Путь для сохраняемых данных (рядом с exe)
-APP_PATH = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
-CONFIG_FILE = os.path.join(APP_PATH, 'config.json')
-BACKUP_DIR = os.path.join(APP_PATH, 'backups')
-
-# Инициализация Flask с исправленными путями к шаблонам и статике
-app = Flask(__name__,
-            template_folder=resource_path('templates'),
-            static_folder=resource_path('static'))
-
-# Добавляем путь к локализациям, чтобы importlib находил их внутри exe
-sys.path.insert(0, resource_path('locales'))
+app = Flask(__name__)
 
 
 def load_config():
@@ -328,14 +310,4 @@ def verify_password():
 
 if __name__ == '__main__':
     ensure_dirs()
-
-    # Автоматическое открытие браузера при запуске
-    import webbrowser
-
-    webbrowser.open('http://127.0.0.1:5000')
-
-    print("Server is launched at http://127.0.0.1:5000. Don't close this window.")
-
-    from waitress import serve
-
-    serve(app, host='127.0.0.1', port=5000)
+    app.run(host='127.0.0.1', port=5000, debug=False, use_reloader=False)
