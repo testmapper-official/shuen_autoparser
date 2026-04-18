@@ -6,3 +6,5 @@ config.json
 backups/
 releases/
 build/
+app.spec
+Shuen Auto.spec
