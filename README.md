@@ -10,7 +10,6 @@
 
 ## ✨ Основные возможности
 
-- **Безопасная верификация профиля:** Проверка пароля происходит путем попытки перезаписи данных на сервер и их отката, без хранения пароля в открытом виде (используется SHA-256 хеширование).
 - **Автоматический парсинг:** Фоновый запрос на сервер каждые N минут (настраивается от 1 до 30 минут). При любом изменении JSON-объекта создается локальный бэкап.
 - **Управление бэкапами:** Просмотр, удаление, переименование и восстановление бэкапов на сервер напрямую из интерфейса.
 - **Лаунчер:** Запуск `KKWE - Launch 1.27.bat` с автоматическим определением рабочей директории.
@@ -66,7 +65,6 @@ A local web application for managing profiles and backups for the Warcraft III S
 
 ## ✨ Features
 
-- **Secure Profile Verification:** Password verification is performed by attempting to overwrite data on the server and then rolling it back, without storing the password in plain text (SHA-256 hashing is used).
 - **Automatic Parsing:** A background request to the server every N minutes (configurable from 1 to 30 minutes). If any change in the JSON object occurs, a local backup is created.
 - **Backup Management:** View, delete, rename, and restore backups to the server directly from the interface.
 - **Launcher:** Launch `KKWE - Launch 1.27.bat` with automatic working directory detection.
