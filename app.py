@@ -1,4 +1,4 @@
-import os, json, time, ctypes, threading, importlib, hashlib, requests, sys
+import os, json, time, ctypes, threading, importlib, hashlib, requests, sys, subprocess
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -156,10 +156,13 @@ def handle_config():
 
 @app.route('/api/available_locales')
 def available_locales():
-    locales_dir = os.path.join(os.path.dirname(__name__), 'locales')
-    if not os.path.exists(locales_dir): return jsonify([])
-    return jsonify(
-        [f.replace('.py', '') for f in os.listdir(locales_dir) if f.endswith('.py') and not f.startswith('__')])
+    # ИСПРАВЛЕНО: используем resource_path для поиска внутри собранного exe
+    locales_dir = resource_path('locales')
+    try:
+        files = os.listdir(locales_dir)
+        return jsonify([f.replace('.py','') for f in files if f.endswith('.py') and not f.startswith('__')])
+    except FileNotFoundError:
+        return jsonify([])
 
 
 @app.route('/api/locales/<lang>')
@@ -194,8 +197,8 @@ def launch_bat():
     cfg = load_config()
     if not cfg.get('bat_path') or not os.path.exists(cfg['bat_path']): return jsonify({"error": "Path not set"}), 400
     try:
-        subprocess.Popen([cfg['bat_path']], cwd=os.path.dirname(cfg['bat_path']),
-                         env=os.environ.copy()); return jsonify({"status": "success"})
+        subprocess.Popen([cfg['bat_path']], cwd=os.path.dirname(cfg['bat_path']), env=os.environ.copy())
+        return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
