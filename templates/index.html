@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WC3 Backup Manager</title>
+    <style>
+        :root { --bg-dark: #121212; --bg-card: #1e1e1e; --bg-hover: #2d2d2d; --accent: #bb86fc; --accent-hover: #9b61ec; --danger: #cf6679; --success: #03dac6; --text-main: #e0e0e0; --text-muted: #a0a0a0; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        body { background-color: var(--bg-dark); color: var(--text-main); height: 100vh; display: flex; flex-direction: column; }
+        .header { display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background-color: var(--bg-card); border-bottom: 1px solid #333; }
+        .launch-group { display: flex; gap: 5px; align-items: center; }
+        .btn { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; transition: 0.2s; font-size: 14px; }
+        .btn-primary { background-color: var(--accent); color: #000; } .btn-primary:hover { background-color: var(--accent-hover); }
+        .btn-icon { background-color: var(--bg-hover); color: var(--text-main); border: 1px solid #444; padding: 8px 12px; } .btn-icon:hover { background-color: #444; }
+        .btn-danger { background-color: var(--danger); color: #fff; } .btn-danger:hover { background-color: #b44; }
+        .btn-success { background-color: var(--success); color: #000; } .btn-success:hover { background-color: #02c4b0; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .content { display: flex; flex: 1; overflow: hidden; }
+        .explorer { width: 300px; background-color: var(--bg-card); border-right: 1px solid #333; overflow-y: auto; display: flex; flex-direction: column; }
+        .explorer-header { padding: 15px; font-weight: bold; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center;}
+        .backup-list-container { flex: 1; overflow-y: auto; }
+        .backup-item { padding: 12px 15px; border-bottom: 1px solid #2d2d2d; cursor: pointer; transition: 0.2s; }
+        .backup-item:hover { background-color: var(--bg-hover); } .backup-item.active { background-color: var(--bg-hover); border-left: 3px solid var(--accent); }
+        .file-name { font-size: 14px; color: var(--accent); margin-bottom: 4px; word-break: break-all; } .file-date { font-size: 12px; color: var(--text-muted); }
+        .action-panel { flex: 1; padding: 40px; display: flex; align-items: center; justify-content: center; flex-direction: column; }
+        .action-card { background-color: var(--bg-card); padding: 30px; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); width: 100%; max-width: 500px; display: none; }
+        .action-card h2 { margin-bottom: 20px; color: var(--accent); } .action-buttons { display: flex; gap: 10px; margin-top: 20px; }
+        .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); display: none; align-items: center; justify-content: center; z-index: 1000; }
+        .modal { background-color: var(--bg-card); padding: 30px; border-radius: 8px; width: 100%; max-width: 400px; box-shadow: 0 8px 20px rgba(0,0,0,0.6); position: relative; }
+        .modal-close { position: absolute; top: 10px; right: 15px; background: none; border: none; color: var(--text-muted); font-size: 24px; cursor: pointer; }
+        .modal h2 { margin-bottom: 20px; }
+        .form-group { margin-bottom: 15px; } .form-group label { display: block; margin-bottom: 5px; color: var(--text-muted); font-size: 14px; }
+        .form-group input { width: 100%; padding: 10px; background-color: var(--bg-dark); border: 1px solid #444; border-radius: 4px; color: var(--text-main); outline: none; }
+        .form-group input:focus { border-color: var(--accent); }
+        .path-display { font-size: 12px; color: var(--text-muted); margin-left: 10px; word-break: break-all; }
+        .lang-list { display: flex; flex-direction: column; gap: 10px; }
+        .lang-btn, .step-btn { padding: 15px; background: var(--bg-dark); border: 1px solid #444; color: var(--text-main); border-radius: 6px; font-size: 16px; cursor: pointer; transition: 0.2s; width: 100%; }
+        .lang-btn:hover, .step-btn:hover { background: var(--bg-hover); border-color: var(--accent); }
+        .alert-icon { font-size: 40px; text-align: center; margin-bottom: 15px; color: var(--danger); }
+        .alert-text { text-align: center; color: var(--text-muted); margin-bottom: 25px; line-height: 1.5; }
+        .last-check-label { font-size: 11px; color: var(--text-muted); text-align: right; margin-top: 5px; }
+        .slider-container { display: flex; align-items: center; gap: 15px; }
+                /* Контейнер */
+        .slider-container input[type=range] { flex: 1; }
+
+        /* Базовые сбросы для всех браузеров */
+        input[type=range] {
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 8px;
+            background: transparent;
+            cursor: pointer;
+            outline: none !important; /* Отключает фиолетовую рамку при выделении */
+        }
+
+                /* Трек (полоса) для Chrome/Safari/Edge */
+        input[type=range]::-webkit-slider-runnable-track {
+            height: 8px;
+            border-radius: 4px;
+            background: var(--bg-dark);
+            border: none; /* Убрали рамку */
+        }
+
+        /* Ползунок (круг) для Chrome/Safari/Edge */
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 22px;
+            width: 22px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 3px solid var(--bg-card);
+            margin-top: -7px; // Слегка подкорректировал центрирование после убирания рамки трека
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            transition: background 0.2s, transform 0.15s;
+        }
+        input[type=range]::-webkit-slider-thumb:hover {
+            background: var(--accent-hover);
+            transform: scale(1.15);
+        }
+
+        /* Трек (полоса) для Firefox */
+        input[type=range]::-moz-range-track {
+            height: 8px;
+            border-radius: 4px;
+            background: var(--bg-dark);
+            border: none; /* Убрали рамку */
+        }
+
+        /* Ползунок (круг) для Firefox */
+        input[type=range]::-moz-range-thumb {
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: var(--accent);
+            border: 3px solid var(--bg-card);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+            transition: background 0.2s, transform 0.15s;
+        }
+        input[type=range]::-moz-range-thumb:hover {
+            background: var(--accent-hover);
+            transform: scale(1.15);
+        }
+        .slider-val { font-weight: bold; color: var(--accent); min-width: 30px; text-align: center;}
+        .forced-desc { color: var(--text-muted); margin-bottom: 25px; text-align: center; line-height: 1.5; }
+        /* Добавляем эти правила ниже, чтобы окна настройки были ниже, а ошибки ВЫШЕ */
+        #profileModal, #pathModal { z-index: 2000; }
+        #alertModal, #confirmModal { z-index: 3000 !important; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="launch-group">
+            <button class="btn btn-primary" id="launchBtn" data-i18n="LAUNCH_BTN" disabled></button>
+            <button class="btn btn-icon" id="settingsPathBtn">📁</button>
+            <div class="path-display" id="pathDisplay"></div>
+        </div>
+        <div style="display: flex; gap: 5px; align-items: center;">
+            <div id="lastCheckWidget" style="display:none; margin-right: 10px; text-align: right;">
+                <div style="font-size: 10px; color: var(--text-muted);" data-i18n="LAST_CHECK"></div>
+                <div id="lastCheckTime" style="font-size: 12px; color: var(--success);">--</div>
+            </div>
+            <button class="btn btn-icon" id="langBtn">🌐</button>
+            <button class="btn btn-icon" id="settingsBtn" data-i18n="SETTINGS_BTN"></button>
+            <button class="btn btn-icon" id="profileBtn" data-i18n="PROFILE_BTN"></button>
+        </div>
+    </div>
+
+    <div class="content">
+        <div class="explorer">
+            <div class="explorer-header">
+                <span data-i18n="EXPLORER_HEADER"></span>
+            </div>
+            <div class="backup-list-container" id="backupList"></div>
+        </div>
+        <div class="action-panel">
+            <div class="empty-state" id="emptyState" data-i18n="EMPTY_STATE"></div>
+            <div class="action-card" id="actionCard">
+                <h2 id="selectedBackupName"></h2>
+                <p id="selectedBackupDate" style="color: var(--text-muted); margin-bottom: 20px;"></p>
+                <div class="action-buttons">
+                    <button class="btn btn-danger" id="deleteBackupBtn" data-i18n="DELETE_BACKUP"></button>
+                    <button class="btn btn-success" id="restoreBackupBtn" data-i18n="RESTORE_BACKUP"></button>
+                    <button class="btn btn-primary" id="renameBackupBtn" data-i18n="RENAME_BACKUP"></button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ПРИНУДИТЕЛЬНЫЕ ОКНА НАСТРОЙКИ (Без крестиков закрытия) -->
+    <div class="modal-overlay" id="profileModal" style="z-index: 2000;">
+        <div class="modal">
+            <!-- Крестик по умолчанию скрыт (style="display: none;") -->
+            <button class="modal-close" id="profileModalClose" onclick="closeModal('profileModal')" style="display: none;">&times;</button>
+            <!-- Вернул data-i18n для перевода при загрузке, но добавил id для изменения текста -->
+            <h2 id="profileModalTitle" data-i18n="STEP1_TITLE" style="color: var(--accent); text-align: center;"></h2>
+            <p class="forced-desc" data-i18n="STEP1_DESC"></p>
+            <div class="form-group">
+                <label data-i18n="PROFILE_NAME_LABEL"></label>
+                <input type="text" id="inputProfile" data-i18n-placeholder="PLACEHOLDER_PROFILE">
+            </div>
+            <div class="form-group">
+                <label data-i18n="PROFILE_PASSWORD_LABEL"></label>
+                <input type="password" id="inputPassword" data-i18n-placeholder="PLACEHOLDER_PASSWORD">
+            </div>
+            <button class="btn btn-primary" id="saveProfileBtn" onclick="saveProfile()" style="width: 100%" data-i18n="SAVE_BTN"></button>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="pathModal" style="z-index: 2000;">
+        <div class="modal" style="text-align: center;">
+            <h2 data-i18n="STEP2_MODAL_TITLE" style="color: var(--accent);"></h2>
+            <p class="forced-desc" data-i18n="STEP2_MODAL_DESC"></p>
+            <button class="btn btn-primary" onclick="selectPath()" style="width: 100%; padding: 15px; font-size: 16px;" data-i18n="SELECT_PATH_BTN"></button>
+        </div>
+    </div>
+
+    <!-- Стандартные модалки -->
+    <div class="modal-overlay" id="confirmModal">
+        <div class="modal" style="text-align: center;">
+            <button class="modal-close" onclick="closeModal('confirmModal')">&times;</button>
+            <h2 id="confirmTitle" data-i18n="CONFIRM_TITLE" style="color: var(--danger);"></h2>
+            <p id="confirmText" style="margin-bottom: 25px; color: var(--text-muted);"></p>
+            <div style="display: flex; gap: 10px; justify-content: center;">
+                <button class="btn btn-icon" onclick="closeModal('confirmModal')" data-i18n="CANCEL_BTN"></button>
+                <button class="btn btn-danger" id="confirmActionBtn" data-i18n="CONFIRM_BTN"></button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="langModal">
+        <div class="modal">
+            <button class="modal-close" onclick="closeModal('langModal')">&times;</button>
+            <h2 data-i18n="LANG_MODAL_TITLE" style="text-align:center;"></h2>
+            <div class="lang-list" id="langList"></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="intervalModal">
+        <div class="modal">
+            <button class="modal-close" onclick="closeModal('intervalModal')">&times;</button>
+            <h2 data-i18n="INTERVAL_TITLE"></h2>
+            <div class="form-group">
+                <label data-i18n="INTERVAL_LABEL"></label>
+                <div class="slider-container">
+                    <input type="range" id="intervalSlider" min="1" max="30" value="5">
+                    <div class="slider-val" id="intervalValue">5</div>
+                </div>
+            </div>
+            <button class="btn btn-primary" onclick="saveInterval()" style="width: 100%" data-i18n="SAVE_BTN"></button>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="alertModal">
+        <div class="modal">
+            <div class="alert-icon">⚠️</div>
+            <h2 id="alertTitle" style="color: var(--danger); text-align: center;"></h2>
+            <p id="alertText" class="alert-text"></p>
+            <div style="text-align: center;">
+                <button class="btn btn-primary" onclick="closeModal('alertModal')" data-i18n="CONFIRM_BTN" style="min-width: 120px;"></button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="renameModal">
+        <div class="modal">
+            <button class="modal-close" onclick="closeModal('renameModal')">&times;</button>
+            <h2 data-i18n="RENAME_MODAL_TITLE"></h2>
+            <div class="form-group">
+                <label data-i18n="RENAME_MODAL_LABEL"></label>
+                <input type="text" id="inputRename" data-i18n-placeholder="PLACEHOLDER_PROFILE">
+            </div>
+            <button class="btn btn-primary" onclick="renameBackup()" style="width: 100%" data-i18n="SAVE_BTN"></button>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
