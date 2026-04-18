@@ -29,11 +29,11 @@
 2. Клонируйте или скачайте репозиторий в любую папку.
 3. Откройте терминал в папке проекта и установите необходимые зависимости:
 
-pip install flask requests beautifulsoup4 apscheduler waitress
+`pip install flask requests beautifulsoup4 apscheduler waitress`
 
 4. Запустите приложение:
 
-python app.py
+`python app.py`
 
 5. Браузер откроется автоматически. Если этого не произошло, перейдите по адресу: http://localhost:5000
 
