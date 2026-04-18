@@ -4,4 +4,5 @@ __pycache__
 locales/__pycache__
 config.json
 backups/
-release/
+releases/
+build/
