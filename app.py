@@ -9,10 +9,12 @@ import importlib
 import threading
 import subprocess
 import webbrowser
+import datetime
+import zlib
 
 import requests
 import urllib3
-from scapy.all import sniff, IP, IPv6, TCP
+from scapy.all import AsyncSniffer, IP, IPv6, TCP
 from scapy.arch.windows import get_windows_if_list
 from flask import Flask, render_template, request, jsonify
 from bs4 import BeautifulSoup
@@ -36,6 +38,7 @@ def resource_path(relative_path):
 APP_PATH = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 CONFIG_FILE = os.path.join(APP_PATH, 'config.json')
 BACKUP_DIR = os.path.join(APP_PATH, 'backups')
+LOG_DIR = os.path.join(APP_PATH, 'logs')
 
 app = Flask(__name__,
             template_folder=resource_path('templates'),
@@ -43,20 +46,107 @@ app = Flask(__name__,
 
 sys.path.insert(0, resource_path('locales'))
 
-
 # ==========================================
 # Admin Check & Local Network Hook (Scapy)
 # ==========================================
+last_heartbeat_time = 0
+sniffer_thread = None
+hook_active = False
+
 def is_admin():
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except:
         return False
 
+def parse_one_packet(data):
+    """Парсит одну команду протокола WC3."""
+    if len(data) < 4 or data[0] != 0xF6:
+        return None, 0
+    
+    cmd = data[1]
+    try:
+        if cmd == 0x01 or cmd == 0x02:
+            slen = int.from_bytes(data[2:4], 'little')
+            s = data[4:4+slen].decode('utf-8', errors='replace')
+            term = 1 if len(data) > 4+slen and data[4+slen] == 0 else 0
+            return {"cmd": "set_profile" if cmd == 1 else "set_password", "value": s}, 4 + slen + term
+        elif cmd == 0x03:
+            val = int.from_bytes(data[4:8], 'little')
+            return {"cmd": "set_id", "value": val}, 8
+        elif cmd == 0x05:
+            return {"cmd": "flush"}, 4
+        elif cmd == 0x06:
+            val = data[4] if len(data) > 4 else 0
+            return {"cmd": "event_06", "value": val}, 5
+        elif cmd == 0x07:
+            tlen = int.from_bytes(data[2:4], 'little')
+            offset = 4
+            klen = int.from_bytes(data[offset:offset+2], 'little')
+            offset += 2
+            key = data[offset:offset+klen].decode('utf-8', errors='replace')
+            offset += klen
+            vlen = int.from_bytes(data[offset:offset+2], 'little')
+            offset += 2
+            val = data[offset:offset+vlen].decode('utf-8', errors='replace')
+            return {"cmd": "set_value", "key": key, "value": val}, 4 + tlen
+        elif cmd == 0x08:
+            return {"cmd": "finalize"}, 4
+    except:
+        pass
+    return None, 0
+
+def parse_all_packets(data):
+    """Разбивает поток байтов на отдельные пакеты и парсит их."""
+    res = []
+    offset = 0
+    while offset < len(data):
+        if data[offset] == 0xF6:
+            p, consumed = parse_one_packet(data[offset:])
+            if p and consumed > 0:
+                res.append(p)
+                offset += consumed
+            else:
+                offset += 1
+        else:
+            offset += 1
+    return res
+
+def safe_payload_repr(payload):
+    # 1. Пробуем декодировать кастомный протокол WC3
+    parsed = parse_all_packets(payload)
+    if parsed:
+        return json.dumps(parsed, ensure_ascii=False)
+    
+    # 2. Пытаемся распаковать zlib (если данные сжаты)
+    try:
+        decompressed = zlib.decompress(payload)
+        return safe_payload_repr(decompressed)
+    except:
+        pass
+    
+    try:
+        decompressed = zlib.decompress(payload, -15)
+        return safe_payload_repr(decompressed)
+    except:
+        pass
+
+    # 3. Если это просто читаемый текст
+    try:
+        decoded = payload.decode('utf-8', errors='strict')
+        if all(c.isprintable() or c in '\n\r\t' for c in decoded):
+            return decoded
+    except:
+        pass
+
+    # 4. Fallback на HEX
+    return payload.hex()
+
 def packet_handler(packet):
+    global last_heartbeat_time
     if packet.haslayer(TCP):
         tcp_layer = packet[TCP]
-        payload = tcp_layer.payload
+        payload = bytes(tcp_layer.payload)
         payload_size = len(payload)
         
         if payload_size > 0:
@@ -66,7 +156,22 @@ def packet_handler(packet):
             elif packet.haslayer(IPv6):
                 dst_ip = packet[IPv6].dst
             
-            print(f"\n[NETWORK HOOK] -> Target: {dst_ip}:{tcp_layer.dport} | Payload size: {payload_size} bytes")
+            if payload_size == 4:
+                last_heartbeat_time = time.time()
+            else:
+                now = datetime.datetime.now()
+                date_str = now.strftime("%d.%m.%Y")
+                time_str = now.strftime("%H:%M:%S")
+                log_file = os.path.join(LOG_DIR, f"{date_str}.log")
+                
+                payload_repr = safe_payload_repr(payload)
+                log_entry = f"[{time_str}] IP: {dst_ip}:{tcp_layer.dport} | Size: {payload_size} bytes | Data: {payload_repr}\n"
+                
+                try:
+                    with open(log_file, 'a', encoding='utf-8') as f:
+                        f.write(log_entry)
+                except Exception:
+                    pass
 
 def get_active_interface_name():
     try:
@@ -82,38 +187,37 @@ def get_active_interface_name():
         pass
     return None
 
-def start_network_sniffer():
-    if not is_admin():
-        print("\n" + "="*50)
-        print("ВНИМАНИЕ: ПРИЛОЖЕНИЕ ЗАПУЩЕНО БЕЗ ПРАВ АДМИНИСТРАТОРА!")
-        print("Сетевой хук (Scapy) НЕ БУДЕТ перехватывать пакеты.")
-        print("Пожалуйста, запустите программу от имени Администратора.")
-        print("="*50 + "\n")
+def start_sniffer():
+    global sniffer_thread, hook_active
+    if hook_active:
         return
         
     iface_name = get_active_interface_name()
     if not iface_name:
-        print("[HOOK ERROR] Не удалось определить активную сетевую карту.")
         return
 
-    # Получаем IP-адрес сервера Shuen
     try:
         target_ip = socket.gethostbyname(TARGET_DOMAIN)
     except socket.gaierror:
-        print(f"[HOOK ERROR] Не удалось получить IP для {TARGET_DOMAIN}")
         return
 
-    print(f"[*] Network hook started on interface: '{iface_name}'.")
-    print(f"[*] Filtering traffic ONLY for: {TARGET_DOMAIN} ({target_ip})...")
-    
-    # Жесткий BPF-фильтр: только исходящий TCP трафик на IP сервера Shuen
     bpf_filter = f"dst host {target_ip} and tcp"
     
     try:
-        sniff(iface=iface_name, filter=bpf_filter, prn=packet_handler, store=0, promisc=True)
-    except Exception as e:
-        print(f"[HOOK ERROR] Sniffer failed: {e}. Убедитесь, что Npcap установлен.")
+        sniffer_thread = AsyncSniffer(iface=iface_name, filter=bpf_filter, prn=packet_handler, store=0)
+        sniffer_thread.start()
+        hook_active = True
+    except Exception:
+        pass
 
+def stop_sniffer():
+    global sniffer_thread, hook_active
+    if sniffer_thread and hook_active:
+        try:
+            sniffer_thread.stop()
+        except:
+            pass
+        hook_active = False
 
 # ==========================================
 # App Logic and Helpers
@@ -134,6 +238,8 @@ def save_config(config):
 def ensure_dirs():
     if not os.path.exists(BACKUP_DIR):
         os.makedirs(BACKUP_DIR)
+    if not os.path.exists(LOG_DIR):
+        os.makedirs(LOG_DIR)
 
 def get_latest_backup():
     ensure_dirs()
@@ -151,7 +257,6 @@ def extract_id(data):
                 return str(data[k])
     return str(int(time.time()))
 
-
 # ==========================================
 # Remote Server Communication
 # ==========================================
@@ -166,8 +271,7 @@ def get_remote_data_raw(profile):
             return None
         textarea = BeautifulSoup(r.text, 'html.parser').find('textarea')
         return textarea.text.strip() if textarea else None
-    except Exception as e:
-        print(f"GET Error: {e}")
+    except Exception:
         return None
 
 def post_remote_data(profile, password, data):
@@ -185,10 +289,8 @@ def post_remote_data(profile, password, data):
             verify=False,
             timeout=15
         )
-        print(f"[POST] Profile: {profile}, Status: {r.status_code}, Response: {r.text[:200]}")
         return r.status_code == 200, r.text
     except Exception as e:
-        print(f"[POST Error] {e}")
         return False, str(e)
 
 def parse_and_backup():
@@ -206,9 +308,8 @@ def parse_and_backup():
                     json.dump(remote, f, indent=4)
             config['last_parse_time'] = int(time.time())
             save_config(config)
-    except Exception as e:
-        print(f"Parse error: {e}")
-
+    except Exception:
+        pass
 
 # ==========================================
 # Scheduler Setup
@@ -220,13 +321,16 @@ scheduler.start()
 def restart_scheduler(interval):
     scheduler.reschedule_job('parse_job', trigger='interval', minutes=interval)
 
-
 # ==========================================
 # API Routes
 # ==========================================
 @app.route('/')
 def index():
     return render_template('index.html')
+
+@app.route('/favicon.ico')
+def favicon():
+    return '', 204
 
 @app.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
@@ -308,6 +412,21 @@ def list_backups():
         "backups": [{"name": f, "date": time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(os.path.getmtime(os.path.join(BACKUP_DIR, f))))} for f in files],
         "last_parse_time": cfg.get('last_parse_time', 0)
     })
+
+@app.route('/api/backups/read', methods=['GET'])
+def read_backup():
+    fn = request.args.get('file')
+    if not fn or '..' in fn:
+        return jsonify({"error": "Invalid file"}), 400
+    fp = os.path.join(BACKUP_DIR, fn)
+    if not os.path.exists(fp):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify({"data": data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/backups/rename', methods=['POST'])
 def rename_backup():
@@ -417,23 +536,73 @@ def verify_password():
         save_config(cfg)
 
         return jsonify({"status": "success", "hash": h})
-    except Exception as e:
-        print(f"Verification Exception: {e}")
+    except Exception:
         return jsonify({"error": "ERR_VERIFY_EXCEPTION"})
 
+# ==========================================
+# Hook & Logs API Routes
+# ==========================================
+@app.route('/api/hook/status')
+def hook_status():
+    online = (time.time() - last_heartbeat_time) < 5 if last_heartbeat_time > 0 else False
+    return jsonify({"running": hook_active, "is_admin": is_admin(), "online": online})
+
+@app.route('/api/hook/toggle', methods=['POST'])
+def hook_toggle():
+    if not is_admin():
+        return jsonify({"error": "NEED_ADMIN"}), 403
+    if hook_active:
+        stop_sniffer()
+    else:
+        start_sniffer()
+    return jsonify({"status": "success", "running": hook_active})
+
+@app.route('/api/hook/elevate', methods=['POST'])
+def hook_elevate():
+    if not is_admin():
+        try:
+            params = " ".join(sys.argv[1:])
+            if not getattr(sys, 'frozen', False):
+                params = f'"{os.path.abspath(__file__)}" ' + params
+            ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+            threading.Timer(1.0, os._exit, args=[0]).start()
+            return jsonify({"status": "success"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    return jsonify({"status": "success"})
+
+@app.route('/api/logs', methods=['GET'])
+def list_logs():
+    ensure_dirs()
+    files = [f for f in os.listdir(LOG_DIR) if f.endswith('.log')]
+    files.sort(key=lambda x: os.path.getmtime(os.path.join(LOG_DIR, x)), reverse=True)
+    return jsonify({
+        "logs": [{"name": f, "date": time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(os.path.getmtime(os.path.join(LOG_DIR, f))))} for f in files]
+    })
+
+@app.route('/api/logs/read', methods=['GET'])
+def read_log():
+    fn = request.args.get('file')
+    if not fn or '..' in fn:
+        return jsonify({"error": "Invalid file"}), 400
+    fp = os.path.join(LOG_DIR, fn)
+    if not os.path.exists(fp):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            return jsonify({"content": f.read()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ==========================================
 # Main Entry Point
 # ==========================================
 if __name__ == '__main__':
     ensure_dirs()
-
-    # Start network hook in background thread
-    sniffer_thread = threading.Thread(target=start_network_sniffer, daemon=True)
-    sniffer_thread.start()
+    
+    if is_admin():
+        start_sniffer()
 
     webbrowser.open('http://127.0.0.1:5000')
-    print("Server is launched at http://127.0.0.1:5000. Don't close this window.")
-    print("Network interceptor is active. Launch the game to monitor packets.")
-
+    
     serve(app, host='127.0.0.1', port=5000)
