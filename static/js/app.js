@@ -1,6 +1,7 @@
 let currentConfig = {}, selectedBackup = null, selectedLog = null, T = {}; 
-let backupPolling = null, timerInterval = null, hookPolling = null;
+let backupPolling = null, timerInterval = null, syncPolling = null;
 let currentTab = 'backups';
+let isPendingBackup = false;
 
 const api = async (u, d) => {
     try {
@@ -16,10 +17,21 @@ window.onload = async () => {
     await loadLanguage(currentConfig.lang || 'ru');
     initListeners();
     startTimer();
+    
     loadFiles();
     backupPolling = setInterval(loadFiles, 15000);
-    checkHookStatus();
-    hookPolling = setInterval(checkHookStatus, 2000);
+    checkSyncStatus();
+    syncPolling = setInterval(checkSyncStatus, 2000);
+    
+    document.addEventListener('click', handleTagClicks);
+    
+    // Предупреждение при закрытии
+    window.addEventListener('beforeunload', (e) => {
+        if (isPendingBackup) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
 };
 
 function startTimer() {
@@ -52,7 +64,7 @@ async function loadLanguage(lang) {
     updateUI();
     updateTabUI();
     loadFiles();
-    checkHookStatus();
+    checkSyncStatus();
 }
 
 function initListeners() {
@@ -75,22 +87,22 @@ function initListeners() {
         const isCurrentlyOn = btn.classList.contains('active');
 
         if (isCurrentlyOn) {
-            const r = await api('/api/hook/toggle', {});
+            const r = await api('/api/sync/toggle', {});
             if (r.error) showAlert(T.ERROR_TITLE||'Error', r.error);
-            checkHookStatus();
+            checkSyncStatus();
             return;
         }
 
-        const statusRes = await api('/api/hook/status');
+        const statusRes = await api('/api/sync/status');
         if (statusRes.is_admin) {
-            const r = await api('/api/hook/toggle', {});
+            const r = await api('/api/sync/toggle', {});
             if (r.error) showAlert(T.ERROR_TITLE||'Error', r.error);
-            checkHookStatus();
+            checkSyncStatus();
         } else {
             showConfirm(T.NEED_ADMIN_TITLE || "Admin Rights Required", T.NEED_ADMIN_MSG || "Restart to request admin?", async () => {
                 closeModal('confirmModal');
                 showAlert(T.NEED_ADMIN_TITLE, T.RESTARTING_MSG || "Restarting...");
-                await api('/api/hook/elevate', {});
+                await api('/api/sync/elevate', {});
                 setTimeout(() => window.close(), 1500);
             });
         }
@@ -103,8 +115,8 @@ function initListeners() {
     };
 
     document.getElementById('settingsBtn').onclick = () => {
-        document.getElementById('intervalSlider').value = currentConfig.interval || 5;
-        document.getElementById('intervalValue').innerText = currentConfig.interval || 5;
+        document.getElementById('intervalSlider').value = currentConfig.interval || 15;
+        document.getElementById('intervalValue').innerText = currentConfig.interval || 15;
         openModal('intervalModal');
     };
 
@@ -139,9 +151,7 @@ function initListeners() {
     };
     
     document.getElementById('profileModalClose').onclick = () => {
-        if (currentConfig.hash) {
-            closeModal('profileModal');
-        }
+        if (currentConfig.hash) closeModal('profileModal');
     };
 
     document.getElementById('deleteBackupBtn').onclick = () => showConfirm(T.CONFIRM_TITLE, (T.DELETE_CONFIRM||'Delete?').replace('{name}', selectedBackup), async () => {
@@ -176,7 +186,6 @@ function updateTabUI() {
     document.getElementById('tabBackups').classList.toggle('active', currentTab === 'backups');
     document.getElementById('tabLogs').classList.toggle('active', currentTab === 'logs');
     document.getElementById('explorerHeader').innerText = currentTab === 'backups' ? (T.EXPLORER_HEADER || "Backups") : (T.TAB_LOGS || "Logs");
-    // НЕ ТРОГАЕМ ОСНОВНОЙ КОНТЕНТ ПРИ ПЕРЕКЛЮЧЕНИИ ВКЛАДОК
 }
 
 function selectPath() {
@@ -203,7 +212,6 @@ function updateUI() {
 function checkSetup() {
     const isProfileValid = currentConfig.profile && currentConfig.hash;
     const isPathSet = !!currentConfig.bat_path;
-
     const closeBtn = document.getElementById('profileModalClose');
     const titleEl = document.getElementById('profileModalTitle');
 
@@ -298,21 +306,206 @@ async function loadBackups() {
     const data = await api('/api/backups');
     if (data.last_parse_time) currentConfig.last_parse_time = data.last_parse_time;
     const backups = data.backups || [];
+    const allTags = data.all_tags || {};
 
     const list = document.getElementById('backupList');
     list.innerHTML = '';
-    if (backups.length === 0) {
+    
+    if (data.current_exists) {
+        const d = document.createElement('div'); d.className='backup-item';
+        d.innerHTML = `<div class="file-name">${fileIconSvg} <span>current.json</span> <span class="badge-current">${T.CURRENT_TAG||'Current'}</span></div><div class="file-date">${calendarIconSvg} ${T.NOW||'Real-time'}</div><div class="tag-container" data-file="current.json"></div>`;
+        d.onclick = () => selectBackup('current.json', T.NOW||'Real-time', d, true);
+        if ('current.json' === selectedBackup) d.classList.add('active');
+        list.appendChild(d);
+        renderTagsForFile(d.querySelector('.tag-container'), 'current.json', allTags, data.current_tags);
+    }
+
+    if (backups.length === 0 && !data.current_exists) {
         list.innerHTML = `<div style="padding:15px; text-align:center; color:var(--text-muted);">${T.NO_BACKUPS||'No backups'}</div>`;
     } else {
         backups.forEach(b => {
             const d = document.createElement('div'); d.className='backup-item';
-            d.innerHTML = `<div class="file-name">${fileIconSvg} ${b.name}</div><div class="file-date">${calendarIconSvg} ${b.date}</div>`;
-            d.onclick = () => selectBackup(b.name, b.date, d);
+            const currentBadge = b.is_current ? `<span class="badge-current">${T.CURRENT_TAG||'Current'}</span>` : '';
+            d.innerHTML = `<div class="file-name">${fileIconSvg} ${b.name} ${currentBadge}</div><div class="file-date">${calendarIconSvg} ${b.date}</div><div class="tag-container" data-file="${b.name}"></div>`;
+            d.onclick = () => selectBackup(b.name, b.date, d, false);
             if (b.name === selectedBackup) d.classList.add('active');
             list.appendChild(d);
+            renderTagsForFile(d.querySelector('.tag-container'), b.name, allTags, b.tags);
         });
     }
-    // НЕ ТРОГАЕМ ОСНОВНОЙ КОНТЕНТ
+}
+
+function renderTagsForFile(container, filename, allTags, appliedTagIds) {
+    container.innerHTML = '';
+    if (filename === 'current.json') return;
+    
+    (appliedTagIds || []).forEach(tagId => {
+        const tag = allTags[tagId];
+        if (!tag) return;
+        const pill = document.createElement('div');
+        pill.className = 'tag-pill';
+        pill.style.backgroundColor = tag.color + '33';
+        pill.style.border = `1px solid ${tag.color}`;
+        pill.style.color = tag.color;
+        pill.innerHTML = `<span class="dot-color" style="background:${tag.color}"></span> ${tag.name} <div class="remove-tag" data-action="unassign" data-file="${filename}" data-tag="${tagId}">&times;</div>`;
+        container.appendChild(pill);
+    });
+
+    const addBtn = document.createElement('div');
+    addBtn.className = 'add-tag-btn';
+    addBtn.innerHTML = `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>`;
+    
+    const dropdown = document.createElement('div');
+    dropdown.className = 'tag-dropdown';
+    
+    let ddHtml = '<div class="tag-list">';
+    Object.keys(allTags).forEach(id => {
+        const t = allTags[id];
+        ddHtml += `<div class="tag-option" data-action="assign" data-file="${filename}" data-tag="${id}" style="color:${t.color}"><span class="dot-color" style="background:${t.color}"></span> ${t.name}</div>`;
+    });
+    ddHtml += '</div>';
+    ddHtml += `<div class="tag-create-btn" data-action="manage" data-file="${filename}">⚙️ ${T.MANAGE_TAGS||'Manage Tags'}</div>`;
+    dropdown.innerHTML = ddHtml;
+    
+    addBtn.appendChild(dropdown);
+    container.appendChild(addBtn);
+}
+
+function handleTagClicks(e) {
+    const target = e.target.closest('[data-action]');
+    if (!target) return;
+    
+    const action = target.dataset.action;
+    const file = target.dataset.file;
+    const tag = target.dataset.tag;
+    
+    if (action === 'unassign') {
+        e.stopPropagation();
+        api('/api/tags/unassign', {filename: file, tag_id: tag}).then(() => loadFiles());
+    } else if (action === 'assign') {
+        e.stopPropagation();
+        api('/api/tags/assign', {filename: file, tag_id: tag}).then(() => loadFiles());
+    } else if (action === 'manage') {
+        e.stopPropagation();
+        openTagManagerModal(file);
+    }
+}
+
+let editingTagId = null;
+let tagModalTargetFile = null;
+
+async function openTagManagerModal(filename) {
+    tagModalTargetFile = filename;
+    editingTagId = null;
+    
+    const data = await api('/api/backups');
+    const allTags = data.all_tags || {};
+    
+    let m = document.getElementById('tagManagerModal');
+    if (!m) {
+        m = document.createElement('div');
+        m.id = 'tagManagerModal';
+        m.className = 'modal-overlay';
+        m.innerHTML = `
+            <div class="modal">
+                <h2>${T.MANAGE_TAGS||'Manage Tags'}</h2>
+                <div id="tagListContainer" style="margin-bottom: 20px; max-height: 200px; overflow-y: auto;"></div>
+                <hr style="border-color: var(--card-bg); margin: 15px 0;">
+                <h3 id="tagFormTitle">${T.CREATE_TAG||'Create Tag'}</h3>
+                <label>${T.TAG_NAME||'Tag Name'}</label>
+                <input type="text" id="tagInputName" class="text-input">
+                <label>${T.TAG_COLOR||'Tag Color'}</label>
+                <input type="color" id="tagInputColor" class="color-input" value="#89b4fa">
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="tagCancelBtn" style="display:none;">${T.CANCEL_BTN||'Cancel'}</button>
+                    <button class="btn btn-primary" id="tagSaveBtn">${T.CREATE_BTN||'Create'}</button>
+                </div>
+                <button class="btn btn-secondary" style="margin-top: 15px; width: 100%;" onclick="document.getElementById('tagManagerModal').style.display='none'">${T.CLOSE_BTN||'Close'}</button>
+            </div>`;
+        document.body.appendChild(m);
+        m.onclick = e => { if(e.target === m) m.style.display = 'none'; };
+        m.querySelector('#tagSaveBtn').onclick = saveTag;
+        m.querySelector('#tagCancelBtn').onclick = () => resetTagForm();
+    }
+    
+    renderTagList(allTags);
+    resetTagForm();
+    m.style.display = 'flex';
+}
+
+function renderTagList(allTags) {
+    const container = document.getElementById('tagListContainer');
+    container.innerHTML = '';
+    Object.keys(allTags).forEach(id => {
+        const t = allTags[id];
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.justifyContent = 'space-between';
+        row.style.padding = '8px';
+        row.style.borderBottom = '1px solid var(--card-bg)';
+        row.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 8px; color: ${t.color}">
+                <span class="dot-color" style="background:${t.color}"></span> ${t.name}
+            </div>
+            <div style="display: flex; gap: 5px;">
+                <button class="btn btn-icon" data-action="edit-tag" data-id="${id}" data-name="${t.name}" data-color="${t.color}" style="color: var(--accent-color); padding: 4px;">✎</button>
+                <button class="btn btn-icon" data-action="delete-tag" data-id="${id}" style="color: var(--danger-color); padding: 4px;">✕</button>
+            </div>
+        `;
+        container.appendChild(row);
+    });
+    
+    container.querySelectorAll('[data-action="edit-tag"]').forEach(btn => {
+        btn.onclick = (e) => {
+            e.stopPropagation();
+            editingTagId = btn.dataset.id;
+            document.getElementById('tagInputName').value = btn.dataset.name;
+            document.getElementById('tagInputColor').value = btn.dataset.color;
+            document.getElementById('tagFormTitle').innerText = T.EDIT_TAG || 'Edit Tag';
+            document.getElementById('tagSaveBtn').innerText = T.SAVE_BTN || 'Save';
+            document.getElementById('tagCancelBtn').style.display = 'flex';
+        };
+    });
+
+    container.querySelectorAll('[data-action="delete-tag"]').forEach(btn => {
+        btn.onclick = async (e) => {
+            e.stopPropagation();
+            await api('/api/tags/delete', {tag_id: btn.dataset.id});
+            const data = await api('/api/backups');
+            renderTagList(data.all_tags || {});
+            loadFiles();
+        };
+    });
+}
+
+function resetTagForm() {
+    editingTagId = null;
+    document.getElementById('tagInputName').value = '';
+    document.getElementById('tagInputColor').value = '#89b4fa';
+    document.getElementById('tagFormTitle').innerText = T.CREATE_TAG || 'Create Tag';
+    document.getElementById('tagSaveBtn').innerText = T.CREATE_BTN || 'Create';
+    document.getElementById('tagCancelBtn').style.display = 'none';
+}
+
+async function saveTag() {
+    const name = document.getElementById('tagInputName').value.trim();
+    const color = document.getElementById('tagInputColor').value;
+    if (!name) return;
+    
+    if (editingTagId) {
+        await api('/api/tags/update', {tag_id: editingTagId, name, color});
+    } else {
+        const res = await api('/api/tags/create', {name, color});
+        if (res.tag_id && tagModalTargetFile) {
+            await api('/api/tags/assign', {filename: tagModalTargetFile, tag_id: res.tag_id});
+        }
+    }
+    
+    const data = await api('/api/backups');
+    renderTagList(data.all_tags || {});
+    resetTagForm();
+    loadFiles();
 }
 
 async function loadLogs() {
@@ -332,7 +525,6 @@ async function loadLogs() {
             list.appendChild(d);
         });
     }
-    // НЕ ТРОГАЕМ ОСНОВНОЙ КОНТЕНТ
 }
 
 function showActionCard(name, date, isBackup) {
@@ -343,7 +535,7 @@ function showActionCard(name, date, isBackup) {
     document.getElementById('backupActions').style.display = isBackup ? 'flex' : 'none';
 }
 
-async function selectBackup(name, date, el) {
+async function selectBackup(name, date, el, isCurrent) {
     document.querySelectorAll('.backup-item').forEach(e => e.classList.remove('active'));
     if (el) el.classList.add('active');
     selectedBackup = name;
@@ -351,9 +543,9 @@ async function selectBackup(name, date, el) {
     showActionCard(name, date, true);
     
     document.getElementById('cardContent').innerHTML = '<div style="color:var(--text-muted); padding: 10px;">Loading...</div>';
-    const res = await api(`/api/backups/read?file=${encodeURIComponent(name)}`);
+    const res = isCurrent ? await api('/api/backups/read_current') : await api(`/api/backups/read?file=${encodeURIComponent(name)}`);
     
-    if (selectedBackup !== name) return; // Если пользователь уже выбрал другой файл
+    if (selectedBackup !== name) return; 
 
     if (res.error) {
         document.getElementById('cardContent').innerHTML = `<div style="color:var(--danger-color); padding: 10px;">${res.error}</div>`;
@@ -384,7 +576,7 @@ async function selectLog(name, date, el) {
     document.getElementById('cardContent').innerHTML = '<div style="color:var(--text-muted); padding: 10px;">Loading...</div>';
     const res = await api(`/api/logs/read?file=${encodeURIComponent(name)}`);
 
-    if (selectedLog !== name) return; // Если пользователь уже выбрал другой файл
+    if (selectedLog !== name) return;
 
     if (res.error) {
         document.getElementById('cardContent').innerHTML = `<div style="color:var(--danger-color); padding: 10px;">${res.error}</div>`;
@@ -421,8 +613,8 @@ async function selectLog(name, date, el) {
     document.getElementById('cardContent').innerHTML = html;
 }
 
-async function checkHookStatus() {
-    const r = await api('/api/hook/status');
+async function checkSyncStatus() {
+    const r = await api('/api/sync/status');
     const btn = document.getElementById('hookBtn');
     const btnText = document.getElementById('hookBtnText');
     const dot = document.getElementById('connDot');
@@ -437,12 +629,14 @@ async function checkHookStatus() {
     }
     
     if (r.running) {
-        btnText.innerText = T.HOOK_BTN_ON || "Hook: ON";
+        btnText.innerText = T.SYNC_BTN_ON || "Sync: ON";
         btn.classList.add('active');
     } else {
-        btnText.innerText = T.HOOK_BTN_OFF || "Hook: OFF";
+        btnText.innerText = T.SYNC_BTN_OFF || "Sync: OFF";
         btn.classList.remove('active');
     }
+
+    isPendingBackup = r.pending_backup;
 }
 
 const openModal = id => document.getElementById(id).style.display = 'flex';

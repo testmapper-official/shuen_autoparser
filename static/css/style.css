@@ -21,7 +21,6 @@
     padding: 0;
 }
 
-/* Custom Scrollbar Styles */
 * {
     scrollbar-width: thin;
     scrollbar-color: rgba(137, 180, 250, 0.4) transparent;
@@ -220,6 +219,7 @@ body {
     border-bottom: 1px solid var(--card-bg);
     cursor: pointer;
     transition: background-color 0.2s;
+    position: relative;
 }
 
 .backup-item:hover {
@@ -247,6 +247,115 @@ body {
 }
 .file-date .icon {
     color: var(--text-muted);
+}
+
+/* Tag System Styles */
+.tag-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 5px;
+    align-items: center;
+}
+.badge-current {
+    background-color: var(--success-color);
+    color: #11111b;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: bold;
+    margin-left: 5px;
+}
+.tag-pill {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+}
+.dot-color {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+.remove-tag {
+    cursor: pointer;
+    opacity: 0.6;
+    margin-left: 4px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    background: rgba(0,0,0,0.2);
+    border-radius: 50%;
+}
+.remove-tag:hover { opacity: 1; }
+
+.add-tag-btn {
+    position: relative;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+}
+.add-tag-btn .icon {
+    width: 16px;
+    height: 16px;
+    color: var(--text-muted);
+}
+.add-tag-btn:hover .icon {
+    color: var(--accent-color);
+}
+.tag-dropdown {
+    display: none;
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    background: var(--sidebar-bg);
+    border: 1px solid var(--card-bg);
+    border-radius: 6px;
+    padding: 5px;
+    z-index: 100;
+    min-width: 150px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+}
+.add-tag-btn:hover .tag-dropdown {
+    display: block;
+}
+.tag-option {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px;
+    cursor: pointer;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+.tag-option:hover {
+    background: var(--hover-bg);
+}
+.tag-create-btn {
+    padding: 8px;
+    cursor: pointer;
+    border-top: 1px solid var(--card-bg);
+    margin-top: 5px;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+.tag-create-btn:hover {
+    color: var(--accent-color);
+}
+.color-input {
+    width: 100%;
+    height: 40px;
+    border: 1px solid var(--card-bg);
+    border-radius: 5px;
+    background: var(--bg-color);
+    margin-bottom: 15px;
+    cursor: pointer;
 }
 
 .workspace {
@@ -341,7 +450,6 @@ body {
     padding-right: 5px;
 }
 
-/* Backup JSON Table */
 .json-table {
     width: 100%;
     border-collapse: collapse;
@@ -381,7 +489,6 @@ body {
     color: var(--text-color);
 }
 
-/* Log Viewer */
 .log-group {
     margin-bottom: 15px;
     border: 1px solid var(--bg-color);

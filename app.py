@@ -11,6 +11,10 @@ import subprocess
 import webbrowser
 import datetime
 import zlib
+import uuid
+import queue
+import tkinter as tk
+from tkinter import filedialog
 
 import requests
 import urllib3
@@ -37,6 +41,7 @@ def resource_path(relative_path):
 
 APP_PATH = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 CONFIG_FILE = os.path.join(APP_PATH, 'config.json')
+CURRENT_FILE = os.path.join(APP_PATH, 'current.json')
 BACKUP_DIR = os.path.join(APP_PATH, 'backups')
 LOG_DIR = os.path.join(APP_PATH, 'logs')
 
@@ -47,11 +52,32 @@ app = Flask(__name__,
 sys.path.insert(0, resource_path('locales'))
 
 # ==========================================
+# Tkinter Main Thread Queue (Fix for File Dialog crashes)
+# ==========================================
+tk_queue = queue.Queue()
+
+def tk_main_loop():
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    while True:
+        try:
+            task = tk_queue.get(timeout=0.1)
+            if task['type'] == 'askopenfilename':
+                fp = filedialog.askopenfilename(title=task['title'], filetypes=task['filetypes'])
+                task['callback'](fp)
+        except queue.Empty:
+            pass
+        root.update()
+
+# ==========================================
 # Admin Check & Local Network Hook (Scapy)
 # ==========================================
 last_heartbeat_time = 0
 sniffer_thread = None
-hook_active = False
+sync_running = False
+was_online = False
+is_processing = False
 
 def is_admin():
     try:
@@ -60,7 +86,6 @@ def is_admin():
         return False
 
 def parse_one_packet(data):
-    """Парсит одну команду протокола WC3."""
     if len(data) < 4 or data[0] != 0xF6:
         return None, 0
     
@@ -97,7 +122,6 @@ def parse_one_packet(data):
     return None, 0
 
 def parse_all_packets(data):
-    """Разбивает поток байтов на отдельные пакеты и парсит их."""
     res = []
     offset = 0
     while offset < len(data):
@@ -113,12 +137,10 @@ def parse_all_packets(data):
     return res
 
 def safe_payload_repr(payload):
-    # 1. Пробуем декодировать кастомный протокол WC3
     parsed = parse_all_packets(payload)
     if parsed:
         return json.dumps(parsed, ensure_ascii=False)
     
-    # 2. Пытаемся распаковать zlib (если данные сжаты)
     try:
         decompressed = zlib.decompress(payload)
         return safe_payload_repr(decompressed)
@@ -131,7 +153,6 @@ def safe_payload_repr(payload):
     except:
         pass
 
-    # 3. Если это просто читаемый текст
     try:
         decoded = payload.decode('utf-8', errors='strict')
         if all(c.isprintable() or c in '\n\r\t' for c in decoded):
@@ -139,7 +160,6 @@ def safe_payload_repr(payload):
     except:
         pass
 
-    # 4. Fallback на HEX
     return payload.hex()
 
 def packet_handler(packet):
@@ -188,8 +208,8 @@ def get_active_interface_name():
     return None
 
 def start_sniffer():
-    global sniffer_thread, hook_active
-    if hook_active:
+    global sniffer_thread
+    if sniffer_thread and sniffer_thread.running:
         return
         
     iface_name = get_active_interface_name()
@@ -206,30 +226,86 @@ def start_sniffer():
     try:
         sniffer_thread = AsyncSniffer(iface=iface_name, filter=bpf_filter, prn=packet_handler, store=0)
         sniffer_thread.start()
-        hook_active = True
     except Exception:
         pass
 
 def stop_sniffer():
-    global sniffer_thread, hook_active
-    if sniffer_thread and hook_active:
+    global sniffer_thread
+    if sniffer_thread and sniffer_thread.running:
         try:
             sniffer_thread.stop()
         except:
             pass
-        hook_active = False
+
+# ==========================================
+# Global Sync Control
+# ==========================================
+def start_sync():
+    global sync_running
+    if sync_running: return
+    sync_running = True
+    
+    if is_admin():
+        start_sniffer()
+        
+    try:
+        scheduler.resume_job('parse_job')
+    except:
+        pass
+
+def stop_sync():
+    global sync_running
+    if not sync_running: return
+    sync_running = False
+    
+    stop_sniffer()
+    try:
+        scheduler.pause_job('parse_job')
+        if scheduler.get_job('offline_parse'):
+            scheduler.remove_job('offline_parse')
+    except:
+        pass
+
+def monitor_connection():
+    global was_online
+    while True:
+        time.sleep(2)
+        if not sync_running:
+            was_online = False
+            continue
+
+        online = (time.time() - last_heartbeat_time) < 5 if last_heartbeat_time > 0 else False
+        
+        if online:
+            if not was_online:
+                try: scheduler.pause_job('parse_job')
+                except: pass
+            was_online = True
+        else:
+            if was_online:
+                try:
+                    scheduler.reschedule_job('parse_job', trigger='interval', minutes=load_config().get('interval', 15))
+                    if scheduler.get_job('offline_parse'):
+                        scheduler.remove_job('offline_parse')
+                    scheduler.add_job(parse_and_backup, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=30), id='offline_parse')
+                except Exception as e:
+                    print("Scheduler error:", e)
+            was_online = False
 
 # ==========================================
 # App Logic and Helpers
 # ==========================================
 def load_config():
+    default_cfg = {"profile": "", "password": "", "bat_path": "", "lang": "en", "interval": 15, "hash": "", "last_parse_time": 0, "tags": {}, "file_tags": {}}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                cfg = json.load(f)
+                default_cfg.update(cfg)
+                return default_cfg
         except json.JSONDecodeError:
             pass
-    return {"profile": "", "password": "", "bat_path": "", "lang": "en", "interval": 5, "hash": "", "last_parse_time": 0}
+    return default_cfg
 
 def save_config(config):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
@@ -240,15 +316,6 @@ def ensure_dirs():
         os.makedirs(BACKUP_DIR)
     if not os.path.exists(LOG_DIR):
         os.makedirs(LOG_DIR)
-
-def get_latest_backup():
-    ensure_dirs()
-    files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.json')]
-    if not files:
-        return None
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(BACKUP_DIR, x)), reverse=True)
-    with open(os.path.join(BACKUP_DIR, files[0]), 'r', encoding='utf-8') as f:
-        return json.load(f)
 
 def extract_id(data):
     if isinstance(data, dict):
@@ -294,32 +361,73 @@ def post_remote_data(profile, password, data):
         return False, str(e)
 
 def parse_and_backup():
+    global is_processing
     config = load_config()
     if not config.get('profile') or not config.get('hash'):
         return
+    is_processing = True
     try:
         raw_data = get_remote_data_raw(config['profile'])
-        if raw_data:
-            remote = json.loads(raw_data)
-            if remote != get_latest_backup():
-                bid = extract_id(remote)
-                fn = f"backup_{bid}.json" if not os.path.exists(os.path.join(BACKUP_DIR, f"backup_{bid}.json")) else f"backup_{bid}_{int(time.time())}.json"
-                with open(os.path.join(BACKUP_DIR, fn), 'w', encoding='utf-8') as f:
-                    json.dump(remote, f, indent=4)
-            config['last_parse_time'] = int(time.time())
-            save_config(config)
+        if not raw_data:
+            return
+            
+        with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
+            f.write(raw_data)
+            
+        ensure_dirs()
+        files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.json')]
+        already_exists = False
+        
+        remote_obj = None
+        try:
+            remote_obj = json.loads(raw_data)
+        except:
+            pass
+            
+        for f in files:
+            fp = os.path.join(BACKUP_DIR, f)
+            try:
+                with open(fp, 'r', encoding='utf-8-sig') as hf:
+                    file_data = hf.read()
+                    
+                if file_data.strip() == raw_data.strip():
+                    already_exists = True
+                    break
+                    
+                if remote_obj is not None:
+                    try:
+                        file_obj = json.loads(file_data)
+                        if file_obj == remote_obj:
+                            already_exists = True
+                            break
+                    except:
+                        pass
+            except:
+                pass
+                
+        if not already_exists:
+            bid = extract_id(remote_obj if isinstance(remote_obj, dict) else {})
+            fn = f"backup_{bid}.json" if not os.path.exists(os.path.join(BACKUP_DIR, f"backup_{bid}.json")) else f"backup_{bid}_{int(time.time())}.json"
+            with open(os.path.join(BACKUP_DIR, fn), 'w', encoding='utf-8') as f:
+                f.write(raw_data)
+                
+        config['last_parse_time'] = int(time.time())
+        save_config(config)
     except Exception:
         pass
+    finally:
+        is_processing = False
 
 # ==========================================
 # Scheduler Setup
 # ==========================================
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(parse_and_backup, 'interval', minutes=load_config().get('interval', 5), id='parse_job')
-scheduler.start()
+scheduler.add_job(parse_and_backup, 'interval', minutes=load_config().get('interval', 15), id='parse_job')
+scheduler.start(paused=True) # Стартуем в paused, включится когда пользователь нажмет Sync
 
 def restart_scheduler(interval):
-    scheduler.reschedule_job('parse_job', trigger='interval', minutes=interval)
+    if sync_running:
+        scheduler.reschedule_job('parse_job', trigger='interval', minutes=interval)
 
 # ==========================================
 # API Routes
@@ -335,7 +443,7 @@ def favicon():
 @app.route('/api/config', methods=['GET', 'POST'])
 def handle_config():
     if request.method == 'POST':
-        data, cfg = request.json, load_config()
+        data, cfg = request.json or {}, load_config()
         for k in ['profile', 'password', 'bat_path', 'lang', 'interval']:
             if k in data:
                 cfg[k] = data[k]
@@ -364,22 +472,21 @@ def get_locale(lang):
 
 @app.route('/api/select_path', methods=['POST'])
 def select_path():
-    def dlg():
-        import tkinter as tk
-        from tkinter import filedialog
-        r = tk.Tk()
-        r.withdraw()
-        r.attributes('-topmost', True)
-        fp = filedialog.askopenfilename(title="Select KKWE - Launch 1.27.bat", filetypes=[("Batch", "*.bat")])
-        r.destroy()
+    result_queue = queue.Queue()
+    tk_queue.put({
+        'type': 'askopenfilename',
+        'title': "Select KKWE - Launch 1.27.bat",
+        'filetypes': [("Batch", "*.bat")],
+        'callback': lambda fp: result_queue.put(fp)
+    })
+    try:
+        fp = result_queue.get(timeout=60)
         if fp:
             cfg = load_config()
             cfg['bat_path'] = fp
             save_config(cfg)
-
-    t = threading.Thread(target=dlg)
-    t.start()
-    t.join()
+    except queue.Empty:
+        pass
     return jsonify(load_config())
 
 @app.route('/api/launch', methods=['POST'])
@@ -388,10 +495,7 @@ def launch_bat():
     if not cfg.get('bat_path') or not os.path.exists(cfg['bat_path']):
         return jsonify({"error": "Path not set"}), 400
     try:
-        creation_flags = 0
-        if sys.platform == "win32":
-            creation_flags = subprocess.CREATE_NEW_CONSOLE
-            
+        creation_flags = subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0
         subprocess.Popen(
             [cfg['bat_path']], 
             cwd=os.path.dirname(cfg['bat_path']), 
@@ -408,9 +512,51 @@ def list_backups():
     files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.json')]
     files.sort(key=lambda x: os.path.getmtime(os.path.join(BACKUP_DIR, x)), reverse=True)
     cfg = load_config()
+    
+    if 'file_tags' in cfg:
+        changed = False
+        for f in list(cfg['file_tags'].keys()):
+            if f not in files and f != 'current.json':
+                del cfg['file_tags'][f]
+                changed = True
+        if changed:
+            save_config(cfg)
+            
+    current_data = None
+    if os.path.exists(CURRENT_FILE):
+        try:
+            with open(CURRENT_FILE, 'r', encoding='utf-8') as f:
+                current_data = json.load(f)
+        except:
+            pass
+            
+    backups_list = []
+    for f in files:
+        is_current_match = False
+        fp = os.path.join(BACKUP_DIR, f)
+        
+        if current_data is not None:
+            try:
+                with open(fp, 'r', encoding='utf-8') as hf:
+                    file_data = json.load(hf)
+                if file_data == current_data:
+                    is_current_match = True
+            except:
+                pass
+                
+        backups_list.append({
+            "name": f, 
+            "date": time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(os.path.getmtime(fp))),
+            "tags": cfg.get('file_tags', {}).get(f, []),
+            "is_current": is_current_match
+        })
+        
     return jsonify({
-        "backups": [{"name": f, "date": time.strftime('%d.%m.%Y %H:%M:%S', time.localtime(os.path.getmtime(os.path.join(BACKUP_DIR, f))))} for f in files],
-        "last_parse_time": cfg.get('last_parse_time', 0)
+        "backups": backups_list,
+        "last_parse_time": cfg.get('last_parse_time', 0),
+        "current_exists": os.path.exists(CURRENT_FILE),
+        "current_tags": cfg.get('file_tags', {}).get('current.json', []),
+        "all_tags": cfg.get('tags', {})
     })
 
 @app.route('/api/backups/read', methods=['GET'])
@@ -428,9 +574,20 @@ def read_backup():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/backups/read_current', methods=['GET'])
+def read_current():
+    if not os.path.exists(CURRENT_FILE):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with open(CURRENT_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify({"data": data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/backups/rename', methods=['POST'])
 def rename_backup():
-    data = request.json
+    data = request.json or {}
     old_name = data.get('old_filename')
     new_name = data.get('new_filename')
 
@@ -451,13 +608,17 @@ def rename_backup():
 
     try:
         os.rename(old_path, new_path)
+        cfg = load_config()
+        if 'file_tags' in cfg and old_name in cfg['file_tags']:
+            cfg['file_tags'][new_name] = cfg['file_tags'].pop(old_name)
+            save_config(cfg)
         return jsonify({"status": "success"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/backups/delete', methods=['POST'])
 def delete_backup():
-    fp = os.path.join(BACKUP_DIR, request.json.get('filename', ''))
+    fp = os.path.join(BACKUP_DIR, (request.json or {}).get('filename', ''))
     if os.path.exists(fp):
         os.remove(fp)
         return jsonify({"status": "success"})
@@ -465,7 +626,7 @@ def delete_backup():
 
 @app.route('/api/backups/restore', methods=['POST'])
 def restore_backup():
-    fn, cfg = request.json.get('filename'), load_config()
+    fn, cfg = (request.json or {}).get('filename'), load_config()
     fp = os.path.join(BACKUP_DIR, fn)
     if not os.path.exists(fp):
         return jsonify({"error": "Not found"}), 404
@@ -475,7 +636,10 @@ def restore_backup():
     with open(fp, 'r', encoding='utf-8') as f:
         data = json.load(f)
     try:
-        if post_remote_data(cfg['profile'], cfg['password'], data)[0]:
+        success, _ = post_remote_data(cfg['profile'], cfg['password'], data)
+        if success:
+            with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
             return jsonify({"status": "success"})
         return jsonify({"error": "Failed to save"}), 500
     except Exception as e:
@@ -495,8 +659,9 @@ def check_profile():
 
 @app.route('/api/verify_password', methods=['POST'])
 def verify_password():
-    profile = request.json.get('profile')
-    password = request.json.get('password')
+    data = request.json or {}
+    profile = data.get('profile')
+    password = data.get('password')
 
     if not profile or not password:
         return jsonify({"error": "ERR_EMPTY_FIELDS"})
@@ -540,25 +705,107 @@ def verify_password():
         return jsonify({"error": "ERR_VERIFY_EXCEPTION"})
 
 # ==========================================
-# Hook & Logs API Routes
+# Tags API
 # ==========================================
-@app.route('/api/hook/status')
-def hook_status():
+@app.route('/api/tags/create', methods=['POST'])
+def create_tag():
+    data = request.json or {}
+    name = data.get('name')
+    color = data.get('color')
+    if not name or not color:
+        return jsonify({"error": "Missing fields"}), 400
+    cfg = load_config()
+    if 'tags' not in cfg: cfg['tags'] = {}
+    tag_id = str(uuid.uuid4())[:8]
+    cfg['tags'][tag_id] = {"name": name, "color": color}
+    save_config(cfg)
+    return jsonify({"status": "success", "tag_id": tag_id})
+
+@app.route('/api/tags/assign', methods=['POST'])
+def assign_tag():
+    data = request.json or {}
+    filename = data.get('filename')
+    tag_id = data.get('tag_id')
+    
+    if filename == 'current.json':
+        return jsonify({"error": "Cannot assign tags to current.json"}), 400
+        
+    cfg = load_config()
+    if 'file_tags' not in cfg: cfg['file_tags'] = {}
+    if filename not in cfg['file_tags']:
+        cfg['file_tags'][filename] = []
+    if tag_id not in cfg['file_tags'][filename]:
+        cfg['file_tags'][filename].append(tag_id)
+    save_config(cfg)
+    return jsonify({"status": "success"})
+
+@app.route('/api/tags/unassign', methods=['POST'])
+def unassign_tag():
+    data = request.json or {}
+    filename = data.get('filename')
+    tag_id = data.get('tag_id')
+    cfg = load_config()
+    if 'file_tags' in cfg and filename in cfg['file_tags']:
+        if tag_id in cfg['file_tags'][filename]:
+            cfg['file_tags'][filename].remove(tag_id)
+    save_config(cfg)
+    return jsonify({"status": "success"})
+
+@app.route('/api/tags/update', methods=['POST'])
+def update_tag():
+    data = request.json or {}
+    tag_id = data.get('tag_id')
+    name = data.get('name')
+    color = data.get('color')
+    if not tag_id or not name or not color:
+        return jsonify({"error": "Missing fields"}), 400
+        
+    cfg = load_config()
+    if 'tags' in cfg and tag_id in cfg['tags']:
+        cfg['tags'][tag_id] = {"name": name, "color": color}
+        save_config(cfg)
+        return jsonify({"status": "success"})
+    return jsonify({"error": "Not found"}), 404
+
+@app.route('/api/tags/delete', methods=['POST'])
+def delete_tag():
+    data = request.json or {}
+    tag_id = data.get('tag_id')
+    if not tag_id:
+        return jsonify({"error": "Missing tag_id"}), 400
+        
+    cfg = load_config()
+    if 'tags' in cfg and tag_id in cfg['tags']:
+        del cfg['tags'][tag_id]
+        if 'file_tags' in cfg:
+            for f in cfg['file_tags']:
+                if tag_id in cfg['file_tags'][f]:
+                    cfg['file_tags'][f].remove(tag_id)
+        save_config(cfg)
+        return jsonify({"status": "success"})
+    return jsonify({"error": "Not found"}), 404
+
+# ==========================================
+# Sync & Logs API Routes
+# ==========================================
+@app.route('/api/sync/status')
+def sync_status():
     online = (time.time() - last_heartbeat_time) < 5 if last_heartbeat_time > 0 else False
-    return jsonify({"running": hook_active, "is_admin": is_admin(), "online": online})
+    pending = bool(scheduler.get_job('offline_parse')) if scheduler.get_job('offline_parse') else is_processing
+    return jsonify({"running": sync_running, "is_admin": is_admin(), "online": online, "pending_backup": pending})
 
-@app.route('/api/hook/toggle', methods=['POST'])
-def hook_toggle():
-    if not is_admin():
+@app.route('/api/sync/toggle', methods=['POST'])
+def sync_toggle():
+    if not is_admin() and not sync_running:
         return jsonify({"error": "NEED_ADMIN"}), 403
-    if hook_active:
-        stop_sniffer()
+    if sync_running:
+        stop_sync()
     else:
-        start_sniffer()
-    return jsonify({"status": "success", "running": hook_active})
+        start_sync()
+    return jsonify({"status": "success", "running": sync_running})
 
-@app.route('/api/hook/elevate', methods=['POST'])
-def hook_elevate():
+@app.route('/api/sync/elevate', methods=['POST'])
+def sync_elevate():
     if not is_admin():
         try:
             params = " ".join(sys.argv[1:])
@@ -600,9 +847,10 @@ def read_log():
 if __name__ == '__main__':
     ensure_dirs()
     
-    if is_admin():
-        start_sniffer()
+    threading.Thread(target=monitor_connection, daemon=True).start()
+    threading.Thread(target=parse_and_backup, daemon=True).start()
+
+    threading.Thread(target=serve, args=(app,), kwargs={'host': '127.0.0.1', 'port': 5000}, daemon=True).start()
 
     webbrowser.open('http://127.0.0.1:5000')
-    
-    serve(app, host='127.0.0.1', port=5000)
+    tk_main_loop()
