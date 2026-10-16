@@ -109,3 +109,5 @@ After successfully completing the steps, the interface will be unlocked.
 ## 📄 License
 
 This project is licensed under the Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0). See the LICENSE file for details.
+
+<!-- ruleset probe: no content change, test push will be rejected -->
