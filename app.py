@@ -51,7 +51,7 @@ sys.path.insert(0, resource_path('locales'))
 # ==========================================
 last_heartbeat_time = 0
 sniffer_thread = None
-hook_active = False
+hook_active = False  # conflict probe line (never merge)
 
 def is_admin():
     try:
