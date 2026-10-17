@@ -25,6 +25,8 @@ from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 from waitress import serve
 
+from json_utils import are_json_equivalent
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TARGET_DOMAIN = "shuen.ddns.net"
@@ -78,6 +80,7 @@ sniffer_thread = None
 sync_running = False
 was_online = False
 is_processing = False
+_parse_lock = threading.Lock()
 
 def is_admin():
     try:
@@ -324,6 +327,23 @@ def extract_id(data):
                 return str(data[k])
     return str(int(time.time()))
 
+def safe_join(base_dir, filename):
+    """Join base_dir and filename, refusing paths that escape base_dir.
+
+    Returns the absolute normalized path, or None if the filename is
+    absolute, contains traversal (..) or otherwise points outside base.
+    """
+    if not filename:
+        return None
+    base = os.path.abspath(base_dir)
+    try:
+        path = os.path.abspath(os.path.join(base, filename))
+        if os.path.commonpath([base, path]) != base:
+            return None
+    except (ValueError, TypeError):
+        return None
+    return path
+
 # ==========================================
 # Remote Server Communication
 # ==========================================
@@ -365,6 +385,10 @@ def parse_and_backup():
     config = load_config()
     if not config.get('profile') or not config.get('hash'):
         return
+    # The startup thread and the scheduler job may fire at the same moment:
+    # only one parse may run at a time, otherwise duplicates can appear.
+    if not _parse_lock.acquire(blocking=False):
+        return
     is_processing = True
     try:
         raw_data = get_remote_data_raw(config['profile'])
@@ -381,29 +405,35 @@ def parse_and_backup():
         remote_obj = None
         try:
             remote_obj = json.loads(raw_data)
-        except:
-            pass
+        except (ValueError, TypeError):
+            remote_obj = None
             
         for f in files:
             fp = os.path.join(BACKUP_DIR, f)
             try:
                 with open(fp, 'r', encoding='utf-8-sig') as hf:
                     file_data = hf.read()
-                    
-                if file_data.strip() == raw_data.strip():
-                    already_exists = True
-                    break
-                    
-                if remote_obj is not None:
-                    try:
-                        file_obj = json.loads(file_data)
-                        if file_obj == remote_obj:
-                            already_exists = True
-                            break
-                    except:
-                        pass
-            except:
-                pass
+            except Exception:
+                continue
+
+            # 1) Byte-identical fast path (covers non-JSON payloads too)
+            if file_data.strip() == raw_data.strip():
+                already_exists = True
+                break
+
+            if remote_obj is None:
+                continue
+
+            try:
+                file_obj = json.loads(file_data)
+            except (ValueError, TypeError):
+                continue
+
+            # 2) Order-independent comparison: the server may re-sort keys
+            # or re-serialize numeric values, that must not create duplicates
+            if are_json_equivalent(file_obj, remote_obj, loose=True):
+                already_exists = True
+                break
                 
         if not already_exists:
             bid = extract_id(remote_obj if isinstance(remote_obj, dict) else {})
@@ -562,9 +592,9 @@ def list_backups():
 @app.route('/api/backups/read', methods=['GET'])
 def read_backup():
     fn = request.args.get('file')
-    if not fn or '..' in fn:
+    fp = safe_join(BACKUP_DIR, fn)
+    if not fp:
         return jsonify({"error": "Invalid file"}), 400
-    fp = os.path.join(BACKUP_DIR, fn)
     if not os.path.exists(fp):
         return jsonify({"error": "Not found"}), 404
     try:
@@ -598,8 +628,10 @@ def rename_backup():
     if old_name == new_name:
         return jsonify({"error": "ERR_RENAME_SAME"})
 
-    old_path = os.path.join(BACKUP_DIR, old_name)
-    new_path = os.path.join(BACKUP_DIR, new_name)
+    old_path = safe_join(BACKUP_DIR, old_name)
+    new_path = safe_join(BACKUP_DIR, new_name)
+    if not old_path or not new_path:
+        return jsonify({"error": "INVALID_FILENAME"}), 400
 
     if not os.path.exists(old_path):
         return jsonify({"error": "NOT_FOUND"}), 404
@@ -618,7 +650,9 @@ def rename_backup():
 
 @app.route('/api/backups/delete', methods=['POST'])
 def delete_backup():
-    fp = os.path.join(BACKUP_DIR, (request.json or {}).get('filename', ''))
+    fp = safe_join(BACKUP_DIR, (request.json or {}).get('filename', ''))
+    if not fp:
+        return jsonify({"error": "Invalid file"}), 400
     if os.path.exists(fp):
         os.remove(fp)
         return jsonify({"status": "success"})
@@ -627,7 +661,9 @@ def delete_backup():
 @app.route('/api/backups/restore', methods=['POST'])
 def restore_backup():
     fn, cfg = (request.json or {}).get('filename'), load_config()
-    fp = os.path.join(BACKUP_DIR, fn)
+    fp = safe_join(BACKUP_DIR, fn)
+    if not fp:
+        return jsonify({"error": "Invalid file"}), 400
     if not os.path.exists(fp):
         return jsonify({"error": "Not found"}), 404
     if not cfg.get('profile') or not cfg.get('password'):
@@ -830,9 +866,9 @@ def list_logs():
 @app.route('/api/logs/read', methods=['GET'])
 def read_log():
     fn = request.args.get('file')
-    if not fn or '..' in fn:
+    fp = safe_join(LOG_DIR, fn)
+    if not fp:
         return jsonify({"error": "Invalid file"}), 400
-    fp = os.path.join(LOG_DIR, fn)
     if not os.path.exists(fp):
         return jsonify({"error": "Not found"}), 404
     try:
