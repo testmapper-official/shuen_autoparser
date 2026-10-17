@@ -4,6 +4,9 @@ __pycache__
 locales/__pycache__
 config.json
 backups/
+current.json
+current-data.json
+logs/
 releases/
 build/
 app.spec

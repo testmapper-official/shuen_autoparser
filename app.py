@@ -25,7 +25,8 @@ from bs4 import BeautifulSoup
 from apscheduler.schedulers.background import BackgroundScheduler
 from waitress import serve
 
-from json_utils import are_json_equivalent
+from json_utils import are_json_equivalent, json_fingerprint
+from live_state import StreamParser, LiveStateBuilder
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -44,6 +45,7 @@ def resource_path(relative_path):
 APP_PATH = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
 CONFIG_FILE = os.path.join(APP_PATH, 'config.json')
 CURRENT_FILE = os.path.join(APP_PATH, 'current.json')
+LIVE_FILE = os.path.join(APP_PATH, 'current-data.json')
 BACKUP_DIR = os.path.join(APP_PATH, 'backups')
 LOG_DIR = os.path.join(APP_PATH, 'logs')
 
@@ -81,6 +83,38 @@ sync_running = False
 was_online = False
 is_processing = False
 _parse_lock = threading.Lock()
+
+# Live state: current-data.json assembled in real time from game packets
+live_builder = LiveStateBuilder(LIVE_FILE)
+_stream_parsers = {}
+_stream_lock = threading.Lock()
+
+def _get_stream_parser(flow_key):
+    with _stream_lock:
+        sp = _stream_parsers.get(flow_key)
+        if sp is None:
+            sp = StreamParser()
+            _stream_parsers[flow_key] = sp
+            # Prune idle connections if the registry grows too large
+            if len(_stream_parsers) > 64:
+                cutoff = time.time() - 120
+                for k in [k for k, v in _stream_parsers.items()
+                          if getattr(v, 'last_seen', 0) < cutoff]:
+                    del _stream_parsers[k]
+        sp.last_seen = time.time()
+        return sp
+
+def _drop_stream_parser(flow_key):
+    with _stream_lock:
+        sp = _stream_parsers.pop(flow_key, None)
+    if sp:
+        try:
+            messages, stats = sp.finish()
+            for m in messages:
+                live_builder.apply(m)
+            live_builder.note_stream_stats(stats)
+        except Exception:
+            pass
 
 def is_admin():
     try:
@@ -175,9 +209,11 @@ def packet_handler(packet):
         if payload_size > 0:
             dst_ip = "Unknown"
             if packet.haslayer(IP):
-                dst_ip = packet[IP].dst
+                src_ip, dst_ip = packet[IP].src, packet[IP].dst
             elif packet.haslayer(IPv6):
-                dst_ip = packet[IPv6].dst
+                src_ip, dst_ip = packet[IPv6].src, packet[IPv6].dst
+            else:
+                src_ip = "Unknown"
             
             if payload_size == 4:
                 last_heartbeat_time = time.time()
@@ -195,6 +231,22 @@ def packet_handler(packet):
                         f.write(log_entry)
                 except Exception:
                     pass
+
+            # Live state: reassemble the byte stream and apply commands to
+            # current-data.json in real time
+            try:
+                flow_key = (src_ip, tcp_layer.sport, dst_ip, tcp_layer.dport)
+                sp = _get_stream_parser(flow_key)
+                messages, stats = sp.feed(payload, tcp_layer.seq)
+                live_builder.note_stream_stats(stats)
+                for m in messages:
+                    if m.get('cmd') in ('flush', 'finalize'):
+                        last_heartbeat_time = time.time()
+                    live_builder.apply(m)
+                if int(tcp_layer.flags) & 0x01:  # FIN: connection closed
+                    _drop_stream_parser(flow_key)
+            except Exception:
+                pass
 
 def get_active_interface_name():
     try:
@@ -247,6 +299,12 @@ def start_sync():
     global sync_running
     if sync_running: return
     sync_running = True
+    
+    # A game session begins: seed the live file from the server mirror
+    try:
+        live_builder.init_from_file(CURRENT_FILE)
+    except Exception:
+        pass
     
     if is_admin():
         start_sniffer()
@@ -394,20 +452,36 @@ def parse_and_backup():
         raw_data = get_remote_data_raw(config['profile'])
         if not raw_data:
             return
-            
-        with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
-            f.write(raw_data)
-            
-        ensure_dirs()
-        files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.json')]
-        already_exists = False
-        
+
         remote_obj = None
         try:
             remote_obj = json.loads(raw_data)
         except (ValueError, TypeError):
             remote_obj = None
-            
+
+        with open(CURRENT_FILE, 'w', encoding='utf-8') as f:
+            f.write(raw_data)
+
+        # Verify the server's final data against our live-built local copy
+        try:
+            matches = None
+            if isinstance(remote_obj, dict):
+                matches = are_json_equivalent(remote_obj, live_builder.to_dict(), loose=True)
+            cfg2 = load_config()
+            cfg2['last_verification'] = {
+                'time': int(time.time()),
+                'matches': matches,
+                'server_fp': json_fingerprint(remote_obj) if remote_obj is not None else None,
+                'local_fp': json_fingerprint(live_builder.to_dict()) if matches is not None else None,
+            }
+            save_config(cfg2)
+        except Exception:
+            pass
+
+        ensure_dirs()
+        files = [f for f in os.listdir(BACKUP_DIR) if f.endswith('.json')]
+        already_exists = False
+        
         for f in files:
             fp = os.path.join(BACKUP_DIR, f)
             try:
@@ -840,6 +914,37 @@ def sync_toggle():
         start_sync()
     return jsonify({"status": "success", "running": sync_running})
 
+# ==========================================
+# Live State API (current-data.json)
+# ==========================================
+@app.route('/api/live/status')
+def live_status():
+    st = live_builder.status()
+    st['online'] = (time.time() - last_heartbeat_time) < 5 if last_heartbeat_time > 0 else False
+    cfg = load_config()
+    st['last_verification'] = cfg.get('last_verification')
+    return jsonify(st)
+
+@app.route('/api/live/read')
+def live_read():
+    if not os.path.exists(LIVE_FILE):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with open(LIVE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return jsonify({"data": data, "meta": live_builder.status()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/live/reset', methods=['POST'])
+def live_reset():
+    """Re-seed the live file from the last server mirror (current.json)."""
+    try:
+        live_builder.init_from_file(CURRENT_FILE)
+        return jsonify({"status": "success", "meta": live_builder.status()})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/sync/elevate', methods=['POST'])
 def sync_elevate():
     if not is_admin():
@@ -882,7 +987,13 @@ def read_log():
 # ==========================================
 if __name__ == '__main__':
     ensure_dirs()
-    
+
+    # Restore the live state from a previous session if present
+    try:
+        live_builder.load_existing()
+    except Exception:
+        pass
+
     threading.Thread(target=monitor_connection, daemon=True).start()
     threading.Thread(target=parse_and_backup, daemon=True).start()
 
